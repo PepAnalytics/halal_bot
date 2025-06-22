@@ -1,16 +1,15 @@
 #!/root/halal_bot/venv/bin/python3
-import os
 import re
 import logging
 import mysql.connector
 import requests
 from pathlib import Path
-from aiogram import Bot, Dispatcher, types
+from aiogram import Bot, Dispatcher, types, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.filters import Command
 from aiogram.enums import ParseMode
 from aiogram.types import Message, URLInputFile
-from PIL import Image, ImageFilter, ImageOps
+from PIL import Image, ImageFilter, ImageOps, ImageEnhance
 from pytesseract import TesseractError  # Добавляем в раздел импортов
 import pytesseract
 from bs4 import BeautifulSoup
@@ -18,12 +17,14 @@ from fake_useragent import UserAgent
 import html
 import asyncio
 from tenacity import retry, stop_after_attempt, wait_exponential
-from difflib import SequenceMatcher
+from difflib import SequenceMatcher, get_close_matches
 import time
 import numpy as np
 from dotenv import load_dotenv
 import os
 from pyzbar.pyzbar import decode
+
+
 
 
 # Загрузка переменных из .env
@@ -40,6 +41,7 @@ MYSQL_CONFIG = {
 TOKEN = os.getenv('BOT_TOKEN')
 E_CODE_PATTERN = re.compile(r'\b[E£Е]\d{3}[A-Z]?\b', re.IGNORECASE)  # Учитываем все варианты
 ADDITIVES_CACHE = []
+USER_STATES = {}
 
 # Настройка логирования
 logging.basicConfig(
@@ -50,6 +52,11 @@ logging.basicConfig(
         logging.StreamHandler()
     ]
 )
+
+# Инициализация бота
+bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+dp = Dispatcher()
+pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
 
 
 # Добавляем модели для локального ИИ
@@ -70,10 +77,7 @@ except:
 
 
 
-# Инициализация бота
-bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-dp = Dispatcher()
-pytesseract.pytesseract.tesseract_cmd = r'/usr/bin/tesseract'
+
 
 
 # Инициализация генератора User-Agent
@@ -119,104 +123,91 @@ def extract_barcode(image_path: str) -> str:
         logging.error(f"Ошибка распознавания штрих-кода: {e}")
         return ""
 
-def get_product_info_from_google(barcode: str) -> dict:
-    """Получает информацию о продукте по штрих-коду через Google с улучшенным парсингом"""
+
+def get_product_info(barcode: str) -> dict:
+    """Получает информацию о продукте из нескольких источников"""
+    sources = [
+        get_product_info_from_barcode_list,
+        # get_product_info_from_google,
+        # get_product_info_from_another_source  # Можно добавить дополнительные
+    ]
+
+    for source in sources:
+        try:
+            product_info = source(barcode)
+            if product_info and product_info.get("name") != "Неизвестный продукт":
+                return product_info
+        except Exception as e:
+            logging.error(f"Ошибка получения информации из источника: {e}")
+
+    return {
+        "name": "Неизвестный продукт",
+        "brand": "Информация недоступна",
+        "image_url": "",
+        "source_url": f"https://www.google.com/search?q={barcode}"
+    }
+
+
+def get_product_info_from_barcode_list(barcode: str) -> dict:
+    """Получает информацию о продукте с сайта barcode-list.ru"""
     try:
+        url = f"https://barcode-list.ru/barcode/RU/barcode-{barcode}/Поиск.htm"
         headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-            'Accept-Language': 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7'
+            'User-Agent': ua.random,
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'Accept-Language': 'ru-RU,ru;q=0.8,en-US;q=0.5,en;q=0.3',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1',
         }
 
-        # Шаг 1: Поиск по штрих-коду в Google
-        search_url = f"https://www.google.com/search?q={barcode}"
-        response = requests.get(search_url, headers=headers, timeout=15)
-        soup = BeautifulSoup(response.text, "html.parser")
+        response = requests.get(url, headers=headers, timeout=15)
+        response.raise_for_status()
 
-        # Улучшенное извлечение названия продукта
-        product_name = "Неизвестный продукт"
+        soup = BeautifulSoup(response.text, 'html.parser')
 
-        # Попробуем разные стратегии извлечения названия
-        name_selectors = [
-            ('h1', {'class': 'DgZBFd'}),
-            ('h1', {'class': 'qrShPb'}),
-            ('h2', {'class': 'qrShPb'}),
-            ('h1', {}),
-            ('h2', {}),
-            ('div', {'class': 'DgZBFd'}),
-            ('div', {'class': 'SPZz6b'})
-        ]
+        # Извлекаем название продукта
+        name_element = soup.select_one(
+            '#main > div > table > tbody > tr > td.main_column > table > tbody > tr:nth-child(2) > td:nth-child(3)')
+        product_name = name_element.text.strip() if name_element else "Неизвестный продукт"
 
-        for tag, attrs in name_selectors:
-            element = soup.find(tag, attrs)
-            if element:
-                product_name = element.text.strip()
-                if product_name and len(product_name) > 3:
-                    break
+        # Извлекаем бренд
+        brand_element = soup.select_one(
+            '#main > div > table > tbody > tr > td.main_column > table > tbody > tr:nth-child(3) > td:nth-child(3)')
+        brand = brand_element.text.strip() if brand_element else "Неизвестный бренд"
 
-        # Если название слишком короткое, попробуем из заголовка страницы
-        if len(product_name) < 4:
-            title = soup.find('title')
-            if title:
-                title_text = title.text
-                # Удаляем лишние части заголовка
-                for remove in ['- Google Search', '– Google Поиск']:
-                    title_text = title_text.replace(remove, '')
-                product_name = title_text.strip()
+        # Извлекаем изображение
+        image_element = soup.select_one(
+            '#main > div > table > tbody > tr > td.main_column > table > tbody > tr:nth-child(1) > td > img')
+        image_url = image_element['src'] if image_element and 'src' in image_element.attrs else ""
 
-        # Извлечение бренда
-        brand = "Неизвестный бренд"
-        brand_selectors = [
-            ('div', {'class': 'w1C7Le'}),
-            ('div', {'class': 'wDYxhc', 'data-attrid': 'subtitle'}),
-            ('div', {'class': 'sL6Rbf'})
-        ]
+        # Получаем категорию продукта
+        category_element = soup.select_one(
+            '#main > div > table > tbody > tr > td.main_column > table > tbody > tr:nth-child(4) > td:nth-child(3)')
+        category = category_element.text.strip() if category_element else ""
 
-        for tag, attrs in brand_selectors:
-            element = soup.find(tag, attrs)
-            if element:
-                brand = element.text.strip()
-                if brand and len(brand) > 2:
-                    break
-
-        # Извлечение изображения
-        image_url = ""
-        img_selectors = [
-            ('img', {'class': 'rg_i'}),
-            ('img', {'class': 'XNo5Ab'}),
-            ('img', {'class': 'sh-div__image'})
-        ]
-
-        for tag, attrs in img_selectors:
-            element = soup.find(tag, attrs)
-            if element and 'src' in element.attrs:
-                image_url = element['src']
-                if image_url.startswith('http'):
-                    break
-
-        # Получаем ссылку на первый результат поиска
-        result_link = ""
-        result_element = soup.find('div', class_='tF2Cxc')
-        if result_element:
-            link = result_element.find('a')
-            if link and 'href' in link.attrs:
-                result_link = link['href']
+        # Получаем страну производства
+        country_element = soup.select_one(
+            '#main > div > table > tbody > tr > td.main_column > table > tbody > tr:nth-child(6) > td:nth-child(3)')
+        country = country_element.text.strip() if country_element else ""
 
         return {
             "name": product_name,
             "brand": brand,
             "image_url": image_url,
-            "source_url": result_link or search_url
+            "category": category,
+            "country": country,
+            "source": "barcode-list.ru",
+            "source_url": url
         }
+
     except Exception as e:
-        logging.error(f"Ошибка получения информации о продукте: {e}")
+        logging.error(f"Ошибка получения информации с barcode-list.ru: {e}")
         return {
             "name": "Неизвестный продукт",
             "brand": "Информация недоступна",
             "image_url": "",
-            "source_url": f"https://www.google.com/search?q={barcode}"
+            "source_url": f"https://barcode-list.ru/barcode/RU/barcode-{barcode}/Поиск.htm"
         }
-
-
 def search_product_composition(product_name: str, barcode: str) -> str:
     """Ищет состав продукта в интернете с улучшенной логикой"""
     try:
@@ -328,78 +319,84 @@ def search_product_composition(product_name: str, barcode: str) -> str:
         return "Не удалось получить состав из-за ошибки"
 
 
-async def process_barcode(barcode: str, message: types.Message, image_path: Path):
-    """Обрабатывает штрих-код продукта с улучшенной обработкой ошибок"""
-    try:
-        # Уведомление пользователя
-        await message.answer(f"🔍 Найден штрих-код: <b>{barcode}</b>\nИщу информацию о продукте...")
-
-        # Получение информации о продукте
-        product_info = get_product_info_from_google(barcode)
-
-        # Отправка информации о продукте
-        product_text = (
-            f"📦 <b>Продукт:</b> {product_info['name']}\n"
-            f"🏭 <b>Бренд:</b> {product_info['brand']}\n"
-            f"🔗 <a href='{product_info['source_url']}'>Источник</a>"
-        )
-
-        # Если есть изображение, отправляем его
-        if product_info.get('image_url') and product_info['image_url'].startswith('http'):
-            try:
-                await message.answer_photo(
-                    photo=product_info['image_url'],
-                    caption=product_text
-                )
-            except Exception as e:
-                logging.error(f"Не удалось отправить изображение: {e}")
-                await message.answer(product_text)
-        else:
-            await message.answer(product_text)
-
-        # Поиск состава продукта
-        await message.answer("🧪 Ищу состав продукта...")
-        composition = search_product_composition(product_info['name'], barcode)
-
-        # Форматируем результат
-        if len(composition) > 1000:
-            composition_display = composition[:500] + "...\n\n... [текст сокращен] ...\n\n" + composition[-500:]
-        else:
-            composition_display = composition
-
-        await message.answer(f"📝 <b>Найденный состав:</b>\n{composition_display}")
-
-        # Анализ состава
-        await message.answer("🔬 Анализирую состав на соответствие халяль...")
-
-        # Здесь должен быть ваш код анализа состава
-        # Временно используем заглушку
-        analysis_result = "✅ Предварительный анализ: продукт, вероятно, халяль"
-
-        # Формирование финального ответа
-        result_text = (
-            f"🕌 <b>Результат проверки:</b>\n{analysis_result}\n\n"
-            f"ℹ️ <b>Рекомендации:</b>\n"
-            f"• Это автоматическая проверка, для важных решений консультируйтесь со специалистами\n"
-            f"• Если состав неполный, попробуйте найти более точную информацию\n"
-            f"• Отправьте /help для дополнительной информации"
-        )
-
-        await message.answer(result_text)
-
-    except Exception as e:
-        logging.error(f"Ошибка обработки штрих-кода: {e}", exc_info=True)
-        await message.answer(
-            "⚠️ Произошла ошибка при обработке штрих-кода.\n\n"
-            "Попробуйте один из этих вариантов:\n"
-            "1. Введите штрих-код вручную (13-14 цифр)\n"
-            "2. Отправьте фото состава продукта\n"
-            "3. Поищите информацию на сайте производителя"
-        )
+# async def process_barcode(barcode: str, message: types.Message, image_path: Path):
+#     """Обрабатывает штрих-код продукта с улучшенной обработкой ошибок"""
+#     try:
+#         # Уведомление пользователя
+#         await message.answer(f"🔍 Найден штрих-код: <b>{barcode}</b>\nИщу информацию о продукте...")
+#
+#         # Получение информации о продукте
+#         product_info = get_product_info(barcode)
+#
+#         # Отправка информации о продукте
+#         product_text = (
+#             f"📦 <b>Продукт:</b> {product_info['name']}\n"
+#             f"🏭 <b>Бренд:</b> {product_info['brand']}\n"
+#             f"🔗 <a href='{product_info['source_url']}'>Источник</a>"
+#         )
+#
+#         # Добавляем дополнительные поля, если они есть
+#         if product_info.get('category'):
+#             product_text += f"📋 <b>Категория:</b> {product_info['category']}\n"
+#         if product_info.get('country'):
+#             product_text += f"🌍 <b>Страна:</b> {product_info['country']}\n"
+#
+#         product_text += f"🔗 <a href='{product_info['source_url']}'>Источник ({product_info.get('source', 'Google')})</a>"
+#
+#         # Отправляем изображение, если есть
+#         if product_info.get('image_url') and product_info['image_url'].startswith('http'):
+#             try:
+#                 await message.answer_photo(photo=product_info['image_url'], caption=product_text)
+#             except Exception as e:
+#                 logging.error(f"Не удалось отправить изображение: {e}")
+#                 await message.answer(product_text)
+#         else:
+#             await message.answer(product_text)
+#
+#         # Поиск состава продукта
+#         await message.answer("🧪 Ищу состав продукта...")
+#         composition = search_product_composition(product_info['name'], barcode)
+#
+#         # Форматируем результат
+#         if len(composition) > 1000:
+#             composition_display = composition[:500] + "...\n\n... [текст сокращен] ...\n\n" + composition[-500:]
+#         else:
+#             composition_display = composition
+#
+#         await message.answer(f"📝 <b>Найденный состав:</b>\n{composition_display}")
+#
+#         # Анализ состава
+#         await message.answer("🔬 Анализирую состав на соответствие халяль...")
+#
+#         # Здесь должен быть ваш код анализа состава
+#         # Временно используем заглушку
+#         analysis_result = "✅ Предварительный анализ: продукт, вероятно, халяль"
+#
+#         # Формирование финального ответа
+#         result_text = (
+#             f"🕌 <b>Результат проверки:</b>\n{analysis_result}\n\n"
+#             f"ℹ️ <b>Рекомендации:</b>\n"
+#             f"• Это автоматическая проверка, для важных решений консультируйтесь со специалистами\n"
+#             f"• Если состав неполный, попробуйте найти более точную информацию\n"
+#             f"• Отправьте /help для дополнительной информации"
+#         )
+#
+#         await message.answer(result_text)
+#
+#     except Exception as e:
+#         logging.error(f"Ошибка обработки штрих-кода: {e}", exc_info=True)
+#         await message.answer(
+#             "⚠️ Произошла ошибка при обработке штрих-кода.\n\n"
+#             "Попробуйте один из этих вариантов:\n"
+#             "1. Введите штрих-код вручную (13-14 цифр)\n"
+#             "2. Отправьте фото состава продукта\n"
+#             "3. Поищите информацию на сайте производителя"
+#         )
 
 
 def analyze_composition(composition: str) -> dict:
     """Анализирует состав продукта с использованием ИИ и базы данных"""
+
     # 1. Сначала проверяем через базу данных
     found_additives = []
     composition_lower = composition.lower()
@@ -497,61 +494,6 @@ async def cmd_start(message: Message):
     await message.answer(welcome_text)
 
 
-@dp.message(lambda message: message.photo)
-async def handle_photo(message: types.Message):
-    """Обработка фото: этикетка или штрих-код"""
-    temp_dir = Path("temp")
-    temp_dir.mkdir(exist_ok=True)
-    destination = None
-
-    try:
-        file_id = message.photo[-1].file_id
-        file = await bot.get_file(file_id)
-        destination = temp_dir / f"{file_id}.jpg"
-
-        # Скачиваем файл
-        await bot.download(file=file, destination=destination)
-
-        # Закрываем файл явно после скачивания
-        if destination.exists():
-            with destination.open('rb'):
-                pass  # Просто чтобы убедиться что файл закрыт
-
-        # Проверка размера изображения
-        with Image.open(destination) as img:
-            if img.width < 300 or img.height < 300:
-                await message.answer(
-                    "⚠️ Изображение слишком маленькое. Пожалуйста, отправьте фото более высокого качества.")
-                return
-
-        # Сначала пробуем распознать штрих-код
-        barcode = extract_barcode(destination)
-        if barcode:
-            await process_barcode(barcode, message, destination)
-            return
-
-        # Если штрих-код не найден, обрабатываем как этикетку
-        await process_label(destination, message)
-
-    except Exception as e:
-        logging.error(f"Ошибка обработки фото: {e}")
-        await message.answer("⚠️ Ошибка обработки фото. Попробуйте отправить фото с более четким текстом.")
-    finally:
-        # Удаление файла с защитой от ошибок доступа
-        if destination and destination.exists():
-            try:
-                destination.unlink()
-            except PermissionError as pe:
-                logging.warning(f"Не удалось удалить файл: {pe}")
-                # Попробуем удалить позже
-                await asyncio.sleep(1)
-                try:
-                    destination.unlink()
-                except Exception:
-                    pass
-
-
-
 async def process_barcode(barcode: str, message: types.Message, image_path: Path):
     """Обрабатывает штрих-код продукта"""
     try:
@@ -559,7 +501,7 @@ async def process_barcode(barcode: str, message: types.Message, image_path: Path
         await message.answer(f"🔍 Найден штрих-код: <b>{barcode}</b>\nИщу информацию о продукте в Google...")
 
         # Получение информации о продукте
-        product_info = get_product_info_from_google(barcode)
+        product_info = get_product_info(barcode)
 
         # Отправка информации о продукте
         product_text = (
@@ -585,7 +527,7 @@ async def process_barcode(barcode: str, message: types.Message, image_path: Path
 
         # Поиск состава продукта
         await message.answer("🧪 Ищу состав продукта...")
-        composition = search_product_composition(product_info['name'])
+        composition = search_product_composition(product_info['name'], barcode)
 
         if "не найден" in composition.lower() or "не удалось" in composition.lower():
             await message.answer("❌ Не удалось найти состав продукта. Вы можете ввести его вручную.")
@@ -637,138 +579,128 @@ async def process_barcode(barcode: str, message: types.Message, image_path: Path
         await message.answer("⚠️ Произошла ошибка при обработке штрих-кода. Пожалуйста, попробуйте позже.")
 
 
-# Улучшенная функция распознавания текста
-def preprocess_image(image_path: Path) -> Image:
-    """Расширенная предобработка изображения для улучшения распознавания"""
+def enhance_image(image_path: Path) -> Image:
+    """Улучшение качества изображения для OCR"""
     with Image.open(image_path) as img:
+        # Увеличение размера
+        new_width = img.width * 3
+        new_height = img.height * 3
+        img = img.resize((new_width, new_height), Image.LANCZOS)
+
         # Конвертация в серый цвет
         img = img.convert('L')
 
         # Автоматическая коррекция контраста
-        img = ImageOps.autocontrast(img, cutoff=2)
+        enhancer = ImageEnhance.Contrast(img)
+        img = enhancer.enhance(3.0)  # Увеличиваем контрастность
 
         # Увеличение резкости
-        img = img.filter(ImageFilter.SHARPEN)
+        enhancer = ImageEnhance.Sharpness(img)
+        img = enhancer.enhance(3.0)  # Увеличиваем резкость
 
         # Удаление шумов
-        img = img.filter(ImageFilter.MedianFilter(size=3))
-
-        # Масштабирование для улучшения разрешения
-        new_width = img.width * 2
-        new_height = img.height * 2
-        img = img.resize((new_width, new_height), Image.LANCZOS)
-
-        # Конвертация в numpy array для обработки
-        img_array = np.array(img)
+        img = img.filter(ImageFilter.MedianFilter(size=5))
 
         # Бинаризация с адаптивным порогом
-        threshold = img_array.mean() * 0.8
-        img = img.point(lambda p: 0 if p < threshold else 255)
+        img = img.point(lambda p: 0 if p < 140 else 255)
 
         return img
 
 
+# Улучшенная функция распознавания текста
+# def preprocess_image(image_path: Path) -> Image:
+#     """Расширенная предобработка изображения для улучшения распознавания"""
+#     with Image.open(image_path) as img:
+#         # Конвертация в серый цвет
+#         img = img.convert('L')
+#
+#         # Автоматическая коррекция контраста
+#         img = ImageOps.autocontrast(img, cutoff=2)
+#
+#         # Увеличение резкости
+#         img = img.filter(ImageFilter.SHARPEN)
+#
+#         # Удаление шумов
+#         img = img.filter(ImageFilter.MedianFilter(size=3))
+#
+#         # Масштабирование для улучшения разрешения
+#         new_width = img.width * 2
+#         new_height = img.height * 2
+#         img = img.resize((new_width, new_height), Image.LANCZOS)
+#
+#         # Конвертация в numpy array для обработки
+#         img_array = np.array(img)
+#
+#         # Бинаризация с адаптивным порогом
+#         threshold = img_array.mean() * 0.8
+#         img = img.point(lambda p: 0 if p < threshold else 255)
+#
+#         return img
+
+
 async def extract_text_from_image(image_path: Path) -> str:
-    """Извлечение текста с улучшенной обработкой ошибок и нормализацией"""
+    """Извлечение текста с улучшенной обработкой ошибок"""
+    temp_path = None  # Инициализируем переменную
     try:
-        # Предобработка изображения
-        processed_img = preprocess_image(image_path)
+        # Улучшение изображения
+        processed_img = enhance_image(image_path)
 
-        # Сохраняем временный файл для отладки
-        debug_path = image_path.with_name(f"debug_{image_path.name}")
-        processed_img.save(debug_path)
+        # Сохраняем временный файл для обработки
+        temp_path = image_path.with_name(f"preprocessed_{image_path.name}")
+        processed_img.save(temp_path)
 
-        # Конфигурация Tesseract для лучшего распознавания
-        custom_config = r'--oem 3 --psm 6 -l rus+eng+ukr'
+        # Конфигурация Tesseract
+        custom_config = r'--oem 3 --psm 6 -l rus+eng'
 
-        # Распознавание с повторными попытками
-        text = ""
-        for attempt in range(3):
-            try:
-                text = pytesseract.image_to_string(processed_img, config=custom_config)
-                break
-            except TesseractError as e:
-                logging.warning(f"Ошибка Tesseract (попытка {attempt + 1}): {e}")
-                await asyncio.sleep(0.5)
+        # Распознавание текста
+        text = pytesseract.image_to_string(str(temp_path), config=custom_config)
 
-        # Очистка и нормализация текста
+        # Очистка текста
         return clean_ocr_text(text)
 
+    except Exception as e:
+        logging.error(f"Ошибка OCR: {str(e)}")
+        return ""
     finally:
         # Удаление временного файла
-        if debug_path.exists():
-            debug_path.unlink()
+        if temp_path and temp_path.exists():
+            try:
+                temp_path.unlink()
+            except Exception as e:
+                logging.error(f"Ошибка удаления временного файла: {e}")
 
 def similar(a: str, b: str) -> float:
     """Вычисляет коэффициент сходства между двумя строками"""
     return SequenceMatcher(None, a, b).ratio()
 
-# Можно регулировать в зависимости от качества распознавания
-THRESHOLD_SIMILARITY = 0.75  # 65%
-
-def find_similar_additives(text: str, threshold: float = 0.7) -> list:
-    """Находит добавки в тексте по сходству названия или описания"""
-    found_codes = set()
-    text_lower = text.lower()
-
-    # 1. Поиск E-кодов (точное совпадение)
-    e_codes = re.findall(r'\b[EЕ£]\d{3,4}[a-zA-Z]?\b', text, re.IGNORECASE)
-    for code in e_codes:
-        normalized = re.sub(r'[£Е]', 'E', code, flags=re.IGNORECASE).upper()
-        found_codes.add(normalized)
-
-    # 2. Поиск по сходству с названиями и описаниями добавок
-    for additive in ADDITIVES_CACHE:
-        # Проверяем название добавки
-        if additive['name']:
-            name_similarity = similar(additive['name'].lower(), text_lower)
-            if name_similarity >= threshold:
-                found_codes.add(additive['code'])
-                continue
-
-        # Проверяем описание добавки (если есть)
-        if additive.get('description'):
-            # Берем только первые 50 символов описания для сравнения
-            desc_snippet = additive['description'][:50].lower()
-            desc_similarity = similar(desc_snippet, text_lower)
-            if desc_similarity >= threshold:
-                found_codes.add(additive['code'])
-
-    return list(found_codes)
-
 
 # Улучшенная функция обработки этикетки
 async def process_label(image_path: Path, message: types.Message):
-    """Обрабатывает фото этикетки с улучшенным распознаванием E-кодов"""
+    """Обработка фото этикетки с улучшенным распознаванием"""
     try:
-        # Распознавание текста
-        custom_config = r'--oem 3 --psm 6 -l rus+eng'
-        text = pytesseract.image_to_string(str(image_path), config=custom_config)
-        text = clean_ocr_text(text)
+        # Извлекаем текст
+        text = await extract_text_from_image(image_path)
+        if not text:
+            await message.answer("❌ Не удалось распознать текст. Попробуйте другое фото.")
+            return
 
-        # Улучшенный вывод распознанного текста
+        # Отправляем распознанный текст (сокращенный)
         clean_text = text.replace('|', 'I').replace('[', 'I').replace(']', 'I')
-        clean_text = re.sub(r'\s+', ' ', clean_text)  # Убираем лишние пробелы
-
-        # Отправляем пользователю распознанный текст
+        clean_text = re.sub(r'\s+', ' ', clean_text)
         await message.answer(f"🔍 Распознанный текст:\n{html.escape(clean_text[:3000])}" +
                              ("..." if len(clean_text) > 3000 else ""))
 
-        # Ищем E-коды в тексте
-        found_codes = find_e_codes_in_text(text)
-
-        # Если не найдены коды, ищем в контексте "усилители вкуса"
+        # Анализируем текст
+        found_codes = analyze_text(text)
         if not found_codes:
-            taste_enhancers = re.search(r'усилители вкуса[^\)]*\(([^\)]+)\)', text, re.IGNORECASE)
-            if taste_enhancers:
-                found_codes = find_e_codes_in_text(taste_enhancers.group(1))
+            await message.answer("🔍 Не найдено пищевых добавок в составе")
+            return
 
-        # Получаем детали найденных добавок
+        # Получаем информацию о добавках
         results = []
         unique_codes = set()
         for code in found_codes:
-            # Пропускаем некорректные коды
-            if len(code) < 4 or code in unique_codes:
+            if code in unique_codes:
                 continue
 
             unique_codes.add(code)
@@ -788,41 +720,22 @@ async def process_label(image_path: Path, message: types.Message):
                 )
 
         # Формирование ответа
-        response_parts = []
+        response_parts = [
+            "🔍 <b>Найденные добавки в составе:</b>\n" + "\n".join(results),
+            "\n⚠️ <b>Внимание!</b> Это не все добавки в продукте!",
+            "Если вы видите другие E-коды или ингредиенты, проверьте их:",
+            "1. Введите E-код: <code>/e КОД</code> (например <code>/e E621</code>)",
+            "2. Или отправьте название добавки"
+        ]
 
-        if results:
-            response_parts.append("🔍 <b>Найденные добавки в составе:</b>\n" + "\n".join(results))
-
-            # Важное предупреждение о возможных пропусках
-            warning_msg = (
-                "\n\n⚠️ <b>Внимание!</b> Это не все добавки в продукте!\n"
-                "Если вы видите на этикетке другие E-коды или ингредиенты, "
-                "проверьте их вручную:\n"
-                "1. Введите E-код командой <code>/e КОД</code> (например <code>/e E621</code>)\n"
-                "2. Или отправьте название добавки"
-            )
-            response_parts.append(warning_msg)
-        else:
-            response_parts.append("❌ Не удалось идентифицировать E-коды в составе")
-            response_parts.append(
-                "\nПожалуйста, проверьте состав вручную и введите "
-                "E-коды командой <code>/e КОД</code>"
-            )
-
-        # Отправка результатов
-        full_response = "\n".join(response_parts)
-        await message.answer(full_response)
+        await message.answer("\n".join(response_parts))
 
     except Exception as e:
         logging.error(f"Ошибка обработки этикетки: {e}")
-        await message.answer("⚠️ Ошибка обработки этикетки. Попробуйте отправить фото с более четким текстом.")
+        await message.answer("⚠️ Ошибка обработки этикетки. Попробуйте другое фото.")
     finally:
-        # Удаление временных файлов
         if image_path.exists():
-            try:
-                image_path.unlink()
-            except:
-                pass
+            image_path.unlink()
 
 
 # Добавляем команду для ручной проверки E-кода
@@ -882,7 +795,8 @@ def clean_ocr_text(text: str) -> str:
         'E ': 'E',
         'Е ': 'E',
         'е ': 'E',  # русская е
-        '£': 'E'
+        '£': 'E',
+        ' ': ' ',
     }
 
     for wrong, correct in replacements.items():
@@ -890,13 +804,33 @@ def clean_ocr_text(text: str) -> str:
 
     # Заменяем русскую "е" в кодах (например "е322")
     text = re.sub(r'\b([еЕ])(\d{3})', r'E\2', text)
+
     # Удаляем лишние пробелы в E-кодах
     text = re.sub(r'\b([EЕ])\s?(\d{3})\b', r'\1\2', text)
 
+    # Удаляем специальные символы, кроме нужных
+    text = re.sub(r'[^\w\s,;.:()E\d-]', '', text)
+
+    # Заменяем множественные пробелы
+    text = re.sub(r'\s+', ' ', text).strip()
+
     return text
 
+# Категории добавок для поиска
+ADDITIVE_CATEGORIES = [
+    "красители", "консерванты", "антиокислители", "стабилизаторы",
+    "эмульгаторы", "усилители вкуса", "пеногасители"
+]
 
-# Улучшенная функция поиска E-кодов в тексте
+def normalize_e_code(code: str) -> str:
+    """Нормализация E-кода: приведение к стандартному виду EXXX"""
+    code = code.upper().replace('Е', 'E').replace('£', 'E')
+    code = re.sub(r'[^E0-9]', '', code)
+    if not code.startswith('E'):
+        code = 'E' + code.lstrip('0')
+    return code
+
+
 def find_e_codes_in_text(text: str) -> list:
     """Находит все E-коды в тексте с улучшенной обработкой"""
     # Основной поиск
@@ -910,66 +844,110 @@ def find_e_codes_in_text(text: str) -> list:
     # Нормализация найденных кодов
     normalized_codes = []
     for code in matches:
-        clean_code = re.sub(r'[^E0-9]', '', code)
-        clean_code = clean_code.replace('О', '0').replace('о', '0')
-        clean_code = clean_code.replace('б', '6').replace('Б', '6')
-        clean_code = clean_code.replace('з', '3').replace('З', '3')
+        try:
+            clean_code = re.sub(r'[^E0-9]', '', code)
+            clean_code = clean_code.replace('О', '0').replace('о', '0')
+            clean_code = clean_code.replace('б', '6').replace('Б', '6')
+            clean_code = clean_code.replace('з', '3').replace('З', '3')
 
-        # Форматирование в правильный вид
-        if re.match(r'^E\d{3,4}$', clean_code):
-            normalized_codes.append(clean_code.upper())
+            # Форматирование в правильный вид
+            if re.match(r'^E\d{3,4}$', clean_code):
+                normalized_codes.append(clean_code.upper())
+        except:
+            continue
 
     return list(set(normalized_codes))
 
-@dp.message()
-async def handle_text(message: Message):
-    text = message.text.strip()
 
-    # Нормализация E-кодов
-    if re.match(r'^[eеEЕ]\d{3,4}[a-z]?$', text, re.IGNORECASE):
-        # Приводим к верхнему регистру и заменяем кириллическую Е
-        normalized_text = re.sub(r'[еЕ]', 'E', text).upper()
-        details = await get_additive_details(normalized_text)
-        if not details:
-            return await message.answer(f"❌ Добавка {normalized_text} не найдена в базе")
-    else:
-        # Поиск по названию
-        details = await get_additive_details(text)
-        if not details:
-            return await message.answer("❌ Добавка не найдена. Проверьте правильность написания.")
+def find_additives_by_category(text: str) -> list:
+    """Ищет добавки по категориям в тексте"""
+    found_additives = []
+    text_lower = text.lower()
 
-    # Форматирование и вывод результата
-    status_names = {
-        'halal': '✅ Халяль',
-        'haram': '❌ Харам',
-        'suspicious': '⚠️ Сомнительное',
-        'undefined': '❓ Не определено'
-    }
-    status = status_names.get(details['status'], details['status'])
+    for category in ADDITIVE_CATEGORIES:
+        if category in text_lower:
+            # Ищем категорию в тексте
+            start_idx = text_lower.find(category)
+            if start_idx != -1:
+                # Берем контекст вокруг категории (200 символов)
+                start = max(0, start_idx - 100)
+                end = min(len(text), start_idx + len(category) + 200)
+                context = text[start:end]
 
-    response = (
-        f"🔍 <b>{details['code']} - {details['name']}</b>\n"
-        f"📦 <b>Категория:</b> {details['category'] or 'Не указана'}\n"
-        f"🕌 <b>Статус:</b> {status}\n\n"
-    )
+                # Ищем E-коды в этом контексте
+                e_codes = find_e_codes_in_text(context)
+                found_additives.extend(e_codes)
 
-    if details.get('description'):
-        clean_desc = details['description'].replace('"', '').strip()
-        response += f"📝 <b>Описание:</b>\n{clean_desc[:250]}{'...' if len(clean_desc) > 250 else ''}\n\n"
+    return found_additives
 
-    if details.get('condition_text'):
-        response += f"ℹ️ <b>Условие:</b> {details['condition_text']}"
 
-    await message.answer(response)
+def find_additives_by_name(text: str, threshold: float = 0.8) -> list:
+    """Нечеткий поиск добавок по названию"""
+    found_codes = set()
+    text_lower = text.lower()
+
+    # Собираем все возможные названия добавок
+    all_names = []
+    for additive in ADDITIVES_CACHE:
+        all_names.append(additive['name'].lower())
+        if additive.get('search_terms'):
+            all_names.extend([t.lower() for t in additive['search_terms']])
+
+    # Ищем близкие совпадения
+    words = re.findall(r'\b\w{4,}\b', text_lower)  # Слова из 4+ букв
+    for word in words:
+        # Пропускаем E-коды
+        if re.match(r'^e\d+$', word):
+            continue
+
+        # Ищем похожие названия
+        matches = get_close_matches(word, all_names, n=1, cutoff=threshold)
+        if matches:
+            match_name = matches[0]
+            # Находим код добавки по названию
+            for additive in ADDITIVES_CACHE:
+                if (additive['name'].lower() == match_name or
+                        (additive.get('search_terms') and match_name in [t.lower() for t in additive['search_terms']])):
+                    found_codes.add(additive['code'])
+                    break
+
+    return list(found_codes)
+
+
+def analyze_text(text: str) -> list:
+    """Многоуровневый анализ текста на наличие добавок"""
+    # 1. Поиск E-кодов
+    found_codes = find_e_codes_in_text(text)
+
+    # 2. Поиск по категориям
+    found_codes.extend(find_additives_by_category(text))
+
+    # 3. Нечеткий поиск по названиям
+    found_codes.extend(find_additives_by_name(text))
+
+    # 4. Удаление дубликатов и нормализация
+    unique_codes = set()
+    for code in found_codes:
+        try:
+            norm_code = normalize_e_code(code)
+            if re.match(r'^E\d{3,4}$', norm_code):
+                unique_codes.add(norm_code)
+        except:
+            continue
+
+    return list(unique_codes)
+
+
 
 
 # Улучшенная функция кэширования добавок
 async def cache_additives():
-    global ADDITIVES_CACHE, TERM_INDEX
-    """Кэширование с извлечением всех русских терминов из названия и описания"""
+    """Кэширование добавок с расширенными поисковыми терминами"""
+    global ADDITIVES_CACHE
     conn = None
     try:
         conn = mysql.connector.connect(**MYSQL_CONFIG)
+
         with conn.cursor(dictionary=True) as cursor:
             cursor.execute("SELECT code, name, category, description, status, condition_text FROM additives")
 
@@ -977,48 +955,27 @@ async def cache_additives():
             for row in cursor:
                 search_terms = set()
 
-                # Добавляем код в разных вариантах
-                search_terms.add(row['code'].lower())  # e100
-                search_terms.add(row['code'].upper())  # E100
-                search_terms.add(row['code'])  # E100
-
-
-                # Русское название
+                # Основное название
                 russian_name = row['name'].strip().lower()
                 search_terms.add(russian_name)
 
-                # Разбиваем название на значимые части
-                name_parts = re.split(r'[,/]', russian_name)
-                for part in name_parts:
-                    clean_part = part.strip()
-                    if len(clean_part) > 3:
-                        search_terms.add(clean_part)
-
-                # Извлекаем синонимы из описания
+                # Альтернативные названия из описания
                 if row.get('description'):
                     desc = row['description'].lower()
-
-                    # 1. Ищем альтернативные названия в скобках
+                    # Извлекаем названия в скобках
                     synonyms = re.findall(r'\((.*?)\)', desc)
                     for synonym in synonyms:
-                        # Разделяем списки синонимов
                         for syn in re.split(r'[,;]', synonym):
                             clean_syn = syn.strip()
                             if len(clean_syn) > 3:
                                 search_terms.add(clean_syn)
 
-                    # 2. Извлекаем ключевые термины (существительные)
-                    nouns = re.findall(r'\b[а-яё]{4,}\b', desc)
-                    search_terms.update(nouns[:8])
+                # Ключевые слова из категории
+                if row.get('category'):
+                    category = row['category'].lower()
+                    search_terms.add(category)
 
-                    # 3. Добавляем англоязычные варианты если есть
-                    english_terms = re.findall(r'\b[a-z]{4,}\b', desc)
-                    search_terms.update(english_terms[:3])
-
-                # Фильтрация и сохранение
-                filtered_terms = {term for term in search_terms if len(term) > 2}
-
-                # Добавляем полную информацию о добавке
+                # Добавляем добавку в кэш
                 additive_data = {
                     'code': row['code'].upper(),
                     'name': row['name'],
@@ -1026,10 +983,9 @@ async def cache_additives():
                     'status': row['status'],
                     'description': row['description'],
                     'condition_text': row['condition_text'],
-                    'search_terms': filtered_terms
+                    'search_terms': list(search_terms)
                 }
                 ADDITIVES_CACHE.append(additive_data)
-
 
         logging.info(f"Кэшировано {len(ADDITIVES_CACHE)} добавок")
 
@@ -1038,105 +994,51 @@ async def cache_additives():
     finally:
         if conn and conn.is_connected():
             conn.close()
-    TERM_INDEX = {}
+
+
+async def get_additive_details(search_term: str) -> dict:
+    """Поиск добавки в кэше"""
+    # Нормализация E-кода
+    if re.match(r'^[eеEЕ]\d{3,4}$', search_term, re.IGNORECASE):
+        search_term = normalize_e_code(search_term)
+
+    # Поиск по коду
     for additive in ADDITIVES_CACHE:
-        for term in additive['search_terms']:
-            if term not in TERM_INDEX:
-                TERM_INDEX[term] = []
-            TERM_INDEX[term].append(additive['code'])
-
-    logging.info(f"Создан индекс для {len(TERM_INDEX)} терминов")
-
-def find_in_cache(term: str) -> dict | None:
-    term = term.lower().strip()
-
-    # 0. Проверка точного соответствия кода
-    for additive in ADDITIVES_CACHE:
-        if term == additive['code'].lower():
+        if additive['code'] == search_term.upper():
             return additive
 
-        # Проверка по всем поисковым терминам
-        if term in additive['search_terms']:
+    # Поиск по названию и синонимам
+    search_lower = search_term.lower()
+    for additive in ADDITIVES_CACHE:
+        if search_lower == additive['name'].lower():
             return additive
 
-    # 2. Частичное совпадение в терминах (например, "желат" для "желатин")
-    for additive in ADDITIVES_CACHE:
-        for stored_term in additive['search_terms']:
-            if term in stored_term or stored_term in term:
-                return additive
+        if search_lower in [term.lower() for term in additive.get('search_terms', [])]:
+            return additive
 
-    # 3. Поиск по корню слова (примитивная лемматизация)
-    root = term
-    if len(term) > 4:
-        # Для русских слов удаляем окончания
-        if term.endswith(('ин', 'ан', 'ын', 'ов')):
-            root = term[:-2]
-        elif term.endswith(('ый', 'ий', 'ой', 'ая', 'яя', 'ое', 'ее')):
-            root = term[:-2]
-
-    for additive in ADDITIVES_CACHE:
-        for stored_term in additive['search_terms']:
-            if stored_term.startswith(root):
-                return additive
-
-    # 4. Fuzzy-поиск по схожести строк
+    # Нечеткий поиск
     best_match = None
     best_score = 0.0
-
     for additive in ADDITIVES_CACHE:
-        # Сравнение с кодом
-        code_score = similar(term, additive['code'].lower())
-        if code_score > best_score:
-            best_score = code_score
+        # Сравнение с названием
+        name_score = SequenceMatcher(None, search_lower, additive['name'].lower()).ratio()
+        if name_score > best_score:
+            best_score = name_score
             best_match = additive
 
-        # Сравнение со всеми терминами
-        for stored_term in additive['search_terms']:
-            term_score = similar(term, stored_term)
+        # Сравнение с поисковыми терминами
+        for term in additive.get('search_terms', []):
+            term_score = SequenceMatcher(None, search_lower, term.lower()).ratio()
             if term_score > best_score:
                 best_score = term_score
                 best_match = additive
 
-    # Порог схожести 70%
-    if best_score > 0.7:
+    # Порог схожести 75%
+    if best_score > 0.75:
         return best_match
 
     return None
 
-
-def find_additives_in_text(text: str, threshold: float = 0.75) -> list:
-    """Поиск добавок с использованием NLP-подходов"""
-    # Нормализация текста
-    text = text.lower().translate(str.maketrans('', '', string.punctuation))
-
-    found_additives = []
-
-    # 1. Поиск точных E-кодов
-    e_codes = re.findall(r'\b[еe]\d{3,4}[a-z]?\b', text)
-    for code in set(e_codes):
-        normalized = code.upper().replace('Е', 'E')
-        found_additives.append(normalized)
-
-    # 2. Поиск по ключевым терминам с использованием кэша
-    keywords = ["краситель", "консервант", "эмульгатор", "стабилизатор", "антиоксидант"]
-    for keyword in keywords:
-        if keyword in text:
-            for additive in ADDITIVES_CACHE:
-                if additive['category'] and keyword in additive['category'].lower():
-                    found_additives.append(additive['code'])
-
-    # 3. Поиск по сходству с использованием векторных представлений
-    if len(found_additives) == 0:
-        text_tokens = set(text.split())
-        for additive in ADDITIVES_CACHE:
-            # Вычисляем сходство по Jaccard
-            additive_tokens = set(additive['name'].lower().split())
-            similarity = len(text_tokens & additive_tokens) / len(text_tokens | additive_tokens)
-
-            if similarity > threshold:
-                found_additives.append(additive['code'])
-
-    return list(set(found_additives))
 
 # Исправленная функция поиска в БД
 async def get_additive_details(search_term: str) -> dict:
@@ -1205,7 +1107,6 @@ async def cmd_help(message: Message):
 
 
 @dp.message(lambda message: message.photo)
-@dp.message(lambda message: message.photo)
 async def handle_photo(message: types.Message):
     """Обработчик фото с улучшенной логикой"""
     temp_dir = Path("temp_images")
@@ -1243,13 +1144,128 @@ async def handle_photo(message: types.Message):
                 pass
 
 
-@dp.message()
-async def handle_text(message: Message):
-    """Обработка текстовых сообщений"""
-    text = message.text.strip()
+@dp.message(Command("barcode"))
+async def handle_barcode_command(message: Message):
+    """Обработчик команды /barcode"""
+    USER_STATES[message.from_user.id] = {'state': 'waiting_barcode_photo'}
+    await message.answer("📷 Пожалуйста, отправьте фото штрих-кода продукта")
 
-    # Нормализация ввода
-    normalized_text = text.strip()
+
+@dp.message(F.photo, lambda message: USER_STATES.get(message.from_user.id, {}).get('state') == 'waiting_barcode_photo')
+async def handle_barcode_photo(message: types.Message):
+    """Обработка фото штрих-кода"""
+    user_id = message.from_user.id
+    temp_dir = Path("temp")
+    temp_dir.mkdir(exist_ok=True)
+    file_id = message.photo[-1].file_id
+    file = await bot.get_file(file_id)
+    destination = temp_dir / f"{file_id}.jpg"
+
+    try:
+        await bot.download(file=file, destination=destination)
+        barcode = extract_barcode(destination)
+
+        if barcode:
+            # Получаем информацию о продукте
+            product_info = get_product_info(barcode)
+            USER_STATES[user_id] = {
+                'state': 'waiting_composition_photo',
+                'product_name': product_info['name'],
+                'barcode': barcode
+            }
+
+            # Формируем запрос к @pic
+            search_query = f"{product_info['name']} состав ингредиенты"
+            await message.answer(
+                f"🔍 Найден продукт: <b>{product_info['name']}</b>\n"
+                f"📸 Пожалуйста, используйте бота @pic для поиска фото состава:\n"
+                f"<code>@pic {search_query}</code>\n\n"
+                "После получения результатов выберите лучшее фото состава и отправьте его мне."
+            )
+        else:
+            await message.answer("❌ Не удалось распознать штрих-код. Попробуйте другое фото.")
+
+    except Exception as e:
+        logging.error(f"Ошибка обработки штрих-кода: {e}")
+        await message.answer("⚠️ Ошибка обработки фото. Попробуйте еще раз.")
+    finally:
+        if destination.exists():
+            destination.unlink()
+
+
+@dp.message(F.photo,
+            lambda message: USER_STATES.get(message.from_user.id, {}).get('state') == 'waiting_composition_photo')
+async def handle_composition_photo(message: types.Message):
+    """Обработка фото состава после поиска по баркоду"""
+    user_id = message.from_user.id
+    user_state = USER_STATES.get(user_id, {})
+
+    if not user_state or user_state.get('state') != 'waiting_composition_photo':
+        return
+
+    temp_dir = Path("temp")
+    temp_dir.mkdir(exist_ok=True)
+    file_id = message.photo[-1].file_id
+    file = await bot.get_file(file_id)
+    destination = temp_dir / f"{file_id}.jpg"
+
+    try:
+        await bot.download(file=file, destination=destination)
+
+        # Извлекаем текст из изображения
+        text = await extract_text_from_image(destination)
+        if not text:
+            await message.answer("❌ Не удалось распознать текст на фото. Попробуйте другое изображение.")
+            return
+
+        # Анализируем текст
+        found_codes = analyze_text(text)
+        if not found_codes:
+            await message.answer("🔍 Не найдено пищевых добавок в составе")
+            return
+
+        # Получаем информацию о добавках
+        additives_info = []
+        for code in found_codes:
+            details = await get_additive_details(code)
+            if details:
+                status_names = {
+                    'halal': '✅ Халяль',
+                    'haram': '❌ Харам',
+                    'suspicious': '⚠️ Сомнительное',
+                    'undefined': '❓ Не определено'
+                }
+                status = status_names.get(details['status'], details['status'])
+
+                additives_info.append(
+                    f"• <b>{details['code']}</b> - {details['name']}\n"
+                    f"  Статус: {status}\n"
+                    f"  Категория: {details['category']}\n"
+                )
+
+        # Формируем ответ
+        response = (
+                f"📝 <b>Состав продукта {user_state['product_name']}:</b>\n"
+                f"{text[:500]}{'...' if len(text) > 500 else ''}\n\n"
+                "🔍 <b>Найденные добавки:</b>\n" +
+                "\n".join(additives_info) +
+                "\n⚠️ Это не все добавки в продукте! Для полной проверки изучите состав внимательно."
+        )
+
+        await message.answer(response)
+        del USER_STATES[user_id]
+
+    except Exception as e:
+        logging.error(f"Ошибка анализа состава: {e}")
+        await message.answer("⚠️ Ошибка обработки состава. Попробуйте еще раз.")
+    finally:
+        if destination.exists():
+            destination.unlink()
+
+@dp.message(F.text)
+async def handle_text(message: Message):
+    """Обработка текстовых сообщений только с текстом"""
+    text = message.text.strip()
 
     if not text:
         return await message.answer("Пожалуйста, введите код или название пищевой добавки")
@@ -1258,13 +1274,13 @@ async def handle_text(message: Message):
     found_in_cache = []
     for additive in ADDITIVES_CACHE:
         # Проверяем код
-        if normalized_text == additive['code'].lower():
+        if text.lower() == additive['code'].lower():
             found_in_cache.append(additive)
             continue
 
         # Проверяем название и синонимы
-        for term in additive['search_terms']:
-            if normalized_text in term or term in normalized_text:
+        for term in additive.get('search_terms', []):
+            if text.lower() in term.lower() or term.lower() in text.lower():
                 found_in_cache.append(additive)
                 break
 
@@ -1273,13 +1289,13 @@ async def handle_text(message: Message):
         details = found_in_cache[0]
     else:
         # Поиск в БД с использованием LIKE для частичного совпадения
-        details = await get_additive_details(normalized_text)
+        details = await get_additive_details(text)
 
     if not details:
         # Попробуем найти похожие варианты
         suggestions = []
         for additive in ADDITIVES_CACHE:
-            if SequenceMatcher(None, normalized_text, additive['name'].lower()).ratio() > 0.6:
+            if SequenceMatcher(None, text.lower(), additive['name'].lower()).ratio() > 0.6:
                 suggestions.append(additive['name'])
 
         if suggestions:
@@ -1317,7 +1333,5 @@ async def main():
     await cache_additives()
     await dp.start_polling(bot)
 
-
 if __name__ == '__main__':
-    import asyncio
     asyncio.run(main())
